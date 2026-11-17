@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Local Copilot Session Relay",
+  "version": "0.1.0",
+  "description": "Relay only normal Copilot StreamHub connection URLs to a fixed local native host.",
+  "permissions": [
+    "webRequest",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "wss://substrate.svc.cloud.microsoft/*",
+    "https://copilot.cloud.microsoft/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "incognito": "not_allowed",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtl4Qo2fu4G1Q4pWPy+A8NW81wiL4wR3uB46n3L2tZV9P4GDdnBAIIgnLXYj3zlNvzQMsqO5Uq4xPWdoEVLNllMC56Qkr0BU150z0lsGbzlf11QthMr832bEGD7zstKuH455kz/1GZ7p9gqtJKfX4OI9DFs9mvdFAUv30Jj+b9d5GAIDY89O50iGGOfSjGYF6IwSc4734M/mtEclH5GF8xeeiDH6htxiiEI6DEYuJkgIMrqkJP3JBEP2SnLuyjVWJQVOtNA0lRO4ZOCOABnunwGCfH/KzMtSwn2pEcB6aaEKJbN8fJg8Op8YowSONX/QPruR+aVKGdbmDAFtBf1F+dwIDAQAB"
+}

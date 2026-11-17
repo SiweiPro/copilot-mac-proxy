@@ -1,0 +1,6 @@
+{
+  "port": 19324,
+  "stateDir": "./.local",
+  "capture": "./.local/session.json",
+  "extensionId": "gldnemhkpddiifjfgkhppbkciakggkoc"
+}

@@ -1,0 +1,31 @@
+# Private runtime, credentials, captures, and local configuration
+.local/
+.env
+.env.*
+!.env.example
+config.json
+session.json
+gateway-key
+*settings*.json
+*.har
+*.har.*
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+backups/
+captures/
+
+# Dependencies and local build artifacts
+node_modules/
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+coverage/
+
+# Local test results and session exports
+*-result.json
+verification.json
+STATUS.md

@@ -1,0 +1,18 @@
+{
+  "name": "copilot-mac-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "macOS local Copilot Chat bridge for Claude Code with a Chrome session relay",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node bridge.mjs",
+    "test": "node --test *.test.mjs"
+  },
+  "dependencies": {
+    "ws": "8.18.3"
+  }
+}
