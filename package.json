@@ -1,6 +1,6 @@
 {
   "name": "copilot-mac-proxy",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "macOS local Copilot Chat bridge for Claude Code with a Chrome session relay",
   "license": "MIT",

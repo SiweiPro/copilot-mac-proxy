@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Copilot Session Relay",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local Copilot session relay with optional browser-managed session maintenance on macOS.",
   "permissions": [
     "webRequest",
@@ -12,6 +12,12 @@
   "host_permissions": [
     "wss://substrate.svc.cloud.microsoft/*",
     "https://copilot.cloud.microsoft/*"
+  ],
+  "optional_permissions": [
+    "scripting"
+  ],
+  "optional_host_permissions": [
+    "https://login.microsoftonline.com/*"
   ],
   "background": {
     "service_worker": "background.js",

@@ -17,6 +17,14 @@
     <button id="refresh" type="button">立即尝试更新</button>
     <button id="open" type="button">打开 Copilot</button>
   </div>
+  <form id="account-form" class="account-settings">
+    <label class="toggle"><input id="account-enabled" type="checkbox" disabled> 自动选择已保存账号</label>
+    <label for="account-email" class="detail">完整登录邮箱（仅保存在本机）</label>
+    <input id="account-email" type="email" maxlength="254" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="name@example.com" disabled>
+    <button id="account-save" type="submit" disabled>保存账号设置</button>
+    <p id="account-status" class="detail" role="status">正在读取账号设置…</p>
+    <p class="detail">仅在本扩展创建的后台维护页中，点击与此邮箱完全一致的已保存账号一次。不会读取或填写密码；密码、验证码、MFA 或授权同意仍需手动处理。</p>
+  </form>
   <p class="detail">每 5 分钟检查；临近到期时，在后台打开临时维护页。不会发送聊天或操作你的已有页面。</p>
   <p class="detail">无需 Codex。Chrome 和本机代理需要运行；Mac 休眠、离线或需要重新登录时无法保证续期。</p>
   <script type="module" src="popup.js"></script>
