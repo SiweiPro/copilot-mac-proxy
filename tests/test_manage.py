@@ -186,6 +186,80 @@ class ManagerTests(unittest.TestCase):
             manage.read_json(linked)
         self.assertIsNone(manage.NoRedirect().redirect_request(None, None, 302, '', {}, 'https://elsewhere.example'))
 
+    def run_upgrade(self):
+        def commands(argv, **kwargs):
+            if argv[0] == 'launchctl':
+                return subprocess.CompletedProcess(argv, 1, '', '')
+            return subprocess.CompletedProcess(argv, 0, 'v22.1.0\n', '')
+        with patch.object(manage.sys, 'platform', 'darwin'), \
+             patch.object(manage.shutil, 'which', return_value='/fake/npm'), \
+             patch.object(self.manager, 'port_in_use', return_value=False), \
+             patch.object(self.manager, 'command', side_effect=commands), \
+             contextlib.redirect_stdout(self.output):
+            self.manager.upgrade()
+
+    def test_upgrade_preserves_state_settings_registration_and_code_backup(self):
+        self.setup_runtime()
+        self.snapshot()
+        self.manager.settings.parent.mkdir()
+        manage.atomic_write(self.manager.settings, manage.json_bytes({'keep': True}))
+        with contextlib.redirect_stdout(self.output):
+            self.manager.register_host()
+        preserved = {path: path.read_bytes() for path in [
+            self.manager.root / 'config.json', self.manager.root / 'native-host.command',
+            self.manager.state / 'gateway-key', self.manager.state / 'session.json',
+            self.manager.state / 'launch-agent.plist', self.manager.state / 'native-host.json',
+            self.manager.settings, self.manager.host,
+        ]}
+        old = (self.manager.root / 'native-host.mjs').read_bytes()
+        (self.source / 'native-host.mjs').write_text('// upgraded host\n')
+        (self.source / 'extension/popup.html').write_text('<p>new popup</p>')
+        self.run_upgrade()
+        self.assertEqual((self.manager.root / 'native-host.mjs').read_text(), '// upgraded host\n')
+        self.assertTrue((self.manager.root / 'extension/popup.html').is_file())
+        backups = list(self.manager.state.glob('code-backup-*'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o700)
+        self.assertEqual((backups[0] / 'native-host.mjs').read_bytes(), old)
+        for path, content in preserved.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertFalse(self.manager.plist.exists())
+        self.run_upgrade()
+        self.assertEqual(len(list(self.manager.state.glob('code-backup-*'))), 2)
+        self.assertEqual((backups[0] / 'native-host.mjs').read_bytes(), old)
+
+    def test_upgrade_refuses_a_loaded_service_before_writing(self):
+        self.setup_runtime()
+        old = (self.manager.root / 'native-host.mjs').read_bytes()
+        with patch.object(manage.sys, 'platform', 'darwin'), \
+             patch.object(self.manager, 'command', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+             self.assertRaisesRegex(manage.ManagerError, 'stop'):
+            self.manager.upgrade()
+        self.assertEqual((self.manager.root / 'native-host.mjs').read_bytes(), old)
+        self.assertEqual(list(self.manager.state.glob('code-backup-*')), [])
+
+    def test_upgrade_rolls_back_partial_code_replacement(self):
+        self.setup_runtime()
+        self.snapshot()
+        original = {name: (self.manager.root / name).read_bytes() for name in manage.RUNTIME_FILES}
+        private_before = (self.manager.state / 'session.json').read_bytes()
+        for name in ('bridge.mjs', 'native-host.mjs'):
+            (self.source / name).write_text('// replacement\n')
+        rename = Path.rename
+
+        def fail_once(path, target):
+            if path.name == 'native-host.mjs' and path.parent.name.startswith('.code-upgrade-'):
+                raise OSError('synthetic file replacement failure')
+            return rename(path, target)
+
+        with patch.object(Path, 'rename', fail_once), self.assertRaisesRegex(manage.ManagerError, 'restored'):
+            self.run_upgrade()
+        for name, content in original.items():
+            self.assertEqual((self.manager.root / name).read_bytes(), content)
+        self.assertEqual((self.manager.state / 'session.json').read_bytes(), private_before)
+        self.assertEqual(list(self.manager.state.glob('.code-upgrade-*')), [])
+        self.assertFalse(self.manager.plist.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -6,6 +6,8 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const MAX_MESSAGE = 128 * 1024;
+const MAX_STATUS_RESPONSE = 16 * 1024;
+const STATUS_TIMEOUT_MS = 3000;
 const MODEL_TONES = new Set(['Claude_Container', 'Claude_Fable']);
 const SESSION_PARAMETERS = ['chatsessionid', 'XRoutingParameterSessionKey', 'clientrequestid', 'X-SessionId'];
 const ACCOUNT_PATH = /^\/m365Copilot\/StreamHub\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -139,7 +141,63 @@ export async function reloadGateway(port, key) {
   });
 }
 
-export async function handleNativeMessage(message, { configPath = new URL('./config.json', import.meta.url), origin, reload = reloadGateway } = {}) {
+function unavailableStatus() {
+  return { ok: true, code: 'gateway_unavailable', running: false, tokenExpiresAt: null, active: 0, reloadError: true };
+}
+function normalizeGatewayStatus(value) {
+  if (!object(value) || value.status !== 'ok' || value.bridge !== 'copilot-chat-text-tool-envelope'
+      || !(value.tokenExpiresAt === null || (typeof value.tokenExpiresAt === 'number' && Number.isFinite(value.tokenExpiresAt)))
+      || !Number.isSafeInteger(value.active) || value.active < 0
+      || !(value.reloadError === null || typeof value.reloadError === 'string' || typeof value.reloadError === 'boolean')) {
+    fail('invalid_gateway_status');
+  }
+  // Never forward future health fields, free-form errors, identities or URLs.
+  return { ok: true, code: 'session_status', running: true, tokenExpiresAt: value.tokenExpiresAt,
+    active: value.active, reloadError: Boolean(value.reloadError) };
+}
+
+/** Read-only loopback health probe. No key, snapshot or upstream access. */
+export async function queryGatewayStatus(port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) fail('invalid_local_port');
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (error, value) => {
+      if (done) return;
+      done = true; clearTimeout(deadline);
+      if (error) reject(error); else resolve(value);
+    };
+    // http.request uses this exact loopback destination, ignores environment
+    // proxy variables, and never follows a redirect. No credentials are sent.
+    const req = http.request({ hostname: '127.0.0.1', port, path: '/healthz', method: 'GET',
+      agent: false, timeout: STATUS_TIMEOUT_MS }, res => {
+      if (res.statusCode !== 200) {
+        finish(new HostError('gateway_status_rejected')); res.destroy(); return;
+      }
+      let size = 0; const chunks = [];
+      res.on('data', chunk => {
+        if (done) return;
+        size += chunk.length;
+        if (size > MAX_STATUS_RESPONSE) {
+          finish(new HostError('gateway_status_too_large')); res.destroy(); return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        if (done) return;
+        try { finish(null, normalizeGatewayStatus(JSON.parse(Buffer.concat(chunks).toString('utf8')))); }
+        catch { finish(new HostError('invalid_gateway_status')); }
+      });
+      res.on('error', () => finish(null, unavailableStatus()));
+      res.on('aborted', () => finish(null, unavailableStatus()));
+    });
+    const deadline = setTimeout(() => { finish(null, unavailableStatus()); req.destroy(); }, STATUS_TIMEOUT_MS);
+    req.on('timeout', () => { finish(null, unavailableStatus()); req.destroy(); });
+    req.on('error', () => finish(null, unavailableStatus()));
+    req.end();
+  });
+}
+
+export async function handleNativeMessage(message, { configPath = new URL('./config.json', import.meta.url), origin, reload = reloadGateway, status = queryGatewayStatus } = {}) {
   try {
     const configFile = configPath instanceof URL ? fileURLToPath(configPath) : path.resolve(configPath);
     const root = path.dirname(configFile);
@@ -152,11 +210,16 @@ export async function handleNativeMessage(message, { configPath = new URL('./con
     const dirStat = await fs.lstat(stateDir);
     if (!dirStat.isDirectory() || (dirStat.mode & 0o077) !== 0
         || (process.getuid && dirStat.uid !== process.getuid())) fail('unsafe_state_directory');
+    const port = config.port ?? 19324;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) fail('invalid_local_port');
+    if (message?.type === 'copilot-session-status') {
+      if (!object(message) || message.version !== 1
+          || Object.keys(message).some(key => !['version', 'type'].includes(key))) fail('invalid_message');
+      return await status(port);
+    }
     const next = updateSnapshot(await readJson(capture), message);
     const key = (await readFile(path.join(stateDir, 'gateway-key'), { max: 128 })).trim();
     if (!/^[a-f0-9]{64}$/.test(key)) fail('invalid_local_key');
-    const port = config.port ?? 19324;
-    if (!Number.isInteger(port) || port < 1 || port > 65535) fail('invalid_local_port');
     await atomicSnapshot(capture, next);
     await reload(port, key);
     return { ok: true, code: 'session_updated' };

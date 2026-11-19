@@ -158,12 +158,8 @@ class Manager:
             raise ManagerError('Invalid local gateway key.')
         return value
 
-    def setup(self) -> None:
-        if sys.platform != 'darwin':
-            raise ManagerError('Setup is supported on macOS only.')
-        if self.root.exists() or self.root.is_symlink():
-            raise ManagerError('Runtime already exists; setup never overwrites an installation.')
-        node = shutil.which('node')
+    def validate_payload(self, node: str | None = None) -> str:
+        node = node or shutil.which('node')
         if not node or not shutil.which('npm'):
             raise ManagerError('Install Node.js 22 or later with npm first.')
         result = self.command([node, '--version'], timeout=10)
@@ -173,7 +169,7 @@ class Manager:
         package = read_json(self.source / 'package.json')
         dependency = self.source / 'node_modules/ws/package.json'
         if not dependency.is_file():
-            raise ManagerError('Run npm ci in the repository before setup.')
+            raise ManagerError('Run npm ci in the repository before setup or upgrade.')
         if set(package.get('dependencies', {})) != {'ws'} or read_json(dependency).get('version') != package['dependencies']['ws']:
             raise ManagerError('Installed dependencies do not match package.json; run npm ci.')
         required = [self.source / name for name in RUNTIME_FILES]
@@ -185,6 +181,14 @@ class Manager:
         for p in required:
             if not p.is_dir():
                 require_regular(p)
+        return node
+
+    def setup(self) -> None:
+        if sys.platform != 'darwin':
+            raise ManagerError('Setup is supported on macOS only.')
+        if self.root.exists() or self.root.is_symlink():
+            raise ManagerError('Runtime already exists; setup never overwrites an installation.')
+        node = self.validate_payload()
         self.root.parent.mkdir(parents=True, exist_ok=True)
         # Assemble in a sibling temporary directory, then rename into place.
         staging = Path(tempfile.mkdtemp(prefix='.copilot-mac-install-', dir=self.root.parent))
@@ -214,6 +218,68 @@ class Manager:
             if staging.exists():
                 shutil.rmtree(staging)
         print('Installed runtime. Import a capture, register the host, then start the bridge.')
+
+    def upgrade(self) -> None:
+        if sys.platform != 'darwin':
+            raise ManagerError('Upgrade is supported on macOS only.')
+        self.installed()
+        if self.source == self.root.resolve():
+            raise ManagerError('Run upgrade from a separate repository checkout.')
+        loaded = self.command(['launchctl', 'print', self.target + '/' + LABEL])
+        if loaded.returncode == 0 or self.plist.exists() or self.plist.is_symlink() or self.port_in_use():
+            raise ManagerError('Run manage.py stop and stop any process on the bridge port before upgrading.')
+        self.validate_payload(self.node())
+        names = (*RUNTIME_FILES, 'extension', 'node_modules/ws')
+        for directory in (self.root, self.root / 'node_modules'):
+            st = directory.lstat()
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+                raise ManagerError('Refusing an unsafe installation directory.')
+        for name in names:
+            destination = self.root / name
+            paths = [destination, *destination.rglob('*')] if destination.is_dir() else [destination]
+            for path in paths:
+                if path.is_symlink():
+                    raise ManagerError('Refusing linked files in the installed payload.')
+                if not path.is_dir():
+                    require_regular(path)
+        staging = Path(tempfile.mkdtemp(prefix='.code-upgrade-', dir=self.state))
+        backup = None
+        moved = []
+        installed = []
+        try:
+            for name in names:
+                source, destination = self.source / name, staging / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if source.is_dir():
+                    shutil.copytree(source, destination)
+                else:
+                    shutil.copyfile(source, destination)
+            # Keep each previous code version in a distinct private directory.
+            backup = Path(tempfile.mkdtemp(prefix='code-backup-', dir=self.state))
+            for name in names:
+                old, saved = self.root / name, backup / name
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                old.rename(saved)
+                moved.append(name)
+                (staging / name).rename(old)
+                installed.append(name)
+        except Exception:
+            # Roll back only code; private state and configuration are untouched.
+            try:
+                for name in reversed(installed):
+                    destination = self.root / name
+                    if destination.is_dir():
+                        shutil.rmtree(destination)
+                    else:
+                        destination.unlink()
+                for name in reversed(moved):
+                    (backup / name).rename(self.root / name)
+            except OSError:
+                raise ManagerError('Upgrade failed and rollback was incomplete. Keep the service stopped and recover code from the private code-backup directory.') from None
+            raise ManagerError('Upgrade failed; previous code was restored and the service remains stopped.') from None
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        print('Code upgraded with a private backup. Start the bridge and reload the extension in Chrome.')
 
     def host_manifest(self) -> dict:
         return {
@@ -400,7 +466,7 @@ class Manager:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('setup', 'start', 'stop', 'status', 'register-host', 'configure-claude', 'restore'):
+    for name in ('setup', 'upgrade', 'start', 'stop', 'status', 'register-host', 'configure-claude', 'restore'):
         sub.add_parser(name)
     sub.add_parser('import-har').add_argument('capture', type=Path)
     args = parser.parse_args(argv)

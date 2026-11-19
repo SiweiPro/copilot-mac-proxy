@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Copilot 会话维护</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <h1>Copilot 会话维护</h1>
+  <label class="toggle"><input id="enabled" type="checkbox"> 自动维护会话</label>
+  <p id="status" role="status">正在检查本机代理…</p>
+  <p id="expiry" class="detail"></p>
+  <p id="attention" class="attention" hidden>维护页可能需要登录，或已由你接管。请正常登录 Copilot；完成后点击“检查状态”。也可关闭维护页后再试。</p>
+  <div class="buttons">
+    <button id="check" type="button">检查状态</button>
+    <button id="refresh" type="button">立即尝试更新</button>
+    <button id="open" type="button">打开 Copilot</button>
+  </div>
+  <p class="detail">每 5 分钟检查；临近到期时，在后台打开临时维护页。不会发送聊天或操作你的已有页面。</p>
+  <p class="detail">无需 Codex。Chrome 和本机代理需要运行；Mac 休眠、离线或需要重新登录时无法保证续期。</p>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

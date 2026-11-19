@@ -6,7 +6,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { once } from 'node:events';
 import { compactCapture } from './session-store.mjs';
-import { updateSnapshot, handleNativeMessage, reloadGateway, encodeNativeReply, decodeNativeMessage } from './native-host.mjs';
+import { updateSnapshot, handleNativeMessage, reloadGateway, queryGatewayStatus, encodeNativeReply, decodeNativeMessage } from './native-host.mjs';
 
 const origin = `chrome-extension://${'a'.repeat(32)}/`;
 const account = '00000000-0000-0000-0000-000000000001@00000000-0000-0000-0000-000000000002';
@@ -102,4 +102,103 @@ test('reload connects only to loopback and never follows redirects',async t=>{
   await assert.rejects(reloadGateway(server.address().port,key),{code:'gateway_reload_rejected'});
   assert.equal(calls,2);
   await assert.rejects(reloadGateway(0,key),{code:'invalid_local_port'});
+});
+
+function health(overrides = {}) {
+  return { status: 'ok', bridge: 'copilot-chat-text-tool-envelope', tokenExpiresAt: Date.now() + 600000,
+    active: 0, reloadError: null, ...overrides };
+}
+function unavailable() {
+  return { ok: true, code: 'gateway_unavailable', running: false, tokenExpiresAt: null, active: 0, reloadError: true };
+}
+async function listen(t, handler) {
+  const server = http.createServer(handler);
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
+  return server;
+}
+
+test('status accepts only the exact message and trusted origin without reading credentials or changing files', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'native-status-test-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, '.local'); await fs.mkdir(stateDir, { mode: 0o700 });
+  const configPath = path.join(root, 'config.json');
+  await fs.writeFile(configPath, JSON.stringify({ stateDir: '.local', capture: '.local/session.json', port: 19324, extensionId: 'a'.repeat(32) }));
+  // Neither session.json nor gateway-key exists: status must not require them.
+  const input = { version: 1, type: 'copilot-session-status' };
+  let probes = 0;
+  const expected = { ok: true, code: 'session_status', running: true, tokenExpiresAt: 1, active: 0, reloadError: false };
+  const status = async port => { assert.equal(port, 19324); probes++; return expected; };
+  const reload = async () => assert.fail('Read-only status must never reload the gateway');
+  assert.deepEqual(await handleNativeMessage(input, { configPath, origin, status, reload }), expected);
+  assert.equal(probes, 1);
+  for (const bad of [{ ...input, url: 'https://unexpected.example/' }, { ...input, version: 2 }]) {
+    assert.deepEqual(await handleNativeMessage(bad, { configPath, origin, status, reload }), { ok: false, code: 'invalid_message' });
+  }
+  assert.deepEqual(await handleNativeMessage(input, { configPath, origin: 'chrome-extension://' + 'c'.repeat(32) + '/', status }),
+    { ok: false, code: 'untrusted_extension_origin' });
+  assert.equal(probes, 1);
+  assert.deepEqual(await fs.readdir(stateDir), []);
+  await fs.chmod(stateDir, 0o755);
+  assert.deepEqual(await handleNativeMessage(input, { configPath, origin, status }), { ok: false, code: 'unsafe_state_directory' });
+  assert.equal(probes, 1);
+});
+
+test('status probes only loopback health without credentials and strips all unapproved fields', async t => {
+  let received;
+  const value = health({ tokenExpiresAt: 1, active: 2, reloadError: 'synthetic secret diagnostic',
+    token: 'synthetic-sensitive-value', account: 'synthetic-account', url: url() });
+  const server = await listen(t, (req, res) => {
+    received = { method: req.method, path: req.url, host: req.headers.host, auth: req.headers.authorization, apiKey: req.headers['x-api-key'] };
+    res.end(JSON.stringify(value));
+  });
+  const port = server.address().port;
+  const reply = await queryGatewayStatus(port);
+  assert.deepEqual(received, { method: 'GET', path: '/healthz', host: '127.0.0.1:' + port, auth: undefined, apiKey: undefined });
+  assert.deepEqual(reply, { ok: true, code: 'session_status', running: true, tokenExpiresAt: 1, active: 2, reloadError: true });
+  assert.equal(JSON.stringify(reply).includes('synthetic'), false);
+  assert.equal(JSON.stringify(reply).includes('access_token'), false);
+});
+
+test('status preserves null and expired credentials and rejects incompatible health shapes', async t => {
+  let value = health({ tokenExpiresAt: null });
+  const server = await listen(t, (req, res) => res.end(JSON.stringify(value)));
+  const port = server.address().port;
+  assert.deepEqual(await queryGatewayStatus(port),
+    { ok: true, code: 'session_status', running: true, tokenExpiresAt: null, active: 0, reloadError: false });
+  for (const change of [{ status: 'different' }, { bridge: 'different' }, { tokenExpiresAt: 'tomorrow' },
+    { active: -1 }, { active: 0.5 }, { active: Number.MAX_SAFE_INTEGER + 1 }, { reloadError: { detail: 'secret' } }]) {
+    value = health(change);
+    await assert.rejects(queryGatewayStatus(port), { code: 'invalid_gateway_status' });
+  }
+});
+
+test('status rejects oversized and malformed responses and never follows redirects', async t => {
+  let mode = 'oversized', calls = 0;
+  const server = await listen(t, (req, res) => {
+    calls++;
+    if (mode === 'redirect') { res.writeHead(302, { location: '/must-not-follow' }); res.end('{}'); }
+    else if (mode === 'malformed') res.end('not-json with synthetic secret');
+    else res.end(JSON.stringify(health({ extra: 'x'.repeat(16 * 1024) })));
+  });
+  const port = server.address().port;
+  await assert.rejects(queryGatewayStatus(port), { code: 'gateway_status_too_large' });
+  mode = 'malformed';
+  await assert.rejects(queryGatewayStatus(port), { code: 'invalid_gateway_status' });
+  mode = 'redirect';
+  await assert.rejects(queryGatewayStatus(port), { code: 'gateway_status_rejected' });
+  assert.equal(calls, 3);
+});
+
+test('a stopped gateway and a stalled response produce a bounded unavailable status', async t => {
+  const stopped = http.createServer();
+  stopped.listen(0, '127.0.0.1'); await once(stopped, 'listening');
+  const stoppedPort = stopped.address().port;
+  await new Promise(resolve => stopped.close(resolve));
+  assert.deepEqual(await queryGatewayStatus(stoppedPort), unavailable());
+  const stalled = await listen(t, (req, res) => { res.writeHead(200); res.write('{'); });
+  const start = Date.now();
+  assert.deepEqual(await queryGatewayStatus(stalled.address().port), unavailable());
+  assert.ok(Date.now() - start < 6000, 'health probe must have an absolute three-second deadline');
+  await assert.rejects(queryGatewayStatus(0), { code: 'invalid_local_port' });
 });

@@ -1,0 +1,10 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; font-size: 13px; }
+body { width: 340px; margin: 0; padding: 18px; }
+h1 { margin: 0 0 16px; font-size: 17px; }
+p { line-height: 1.55; }
+.toggle { display: flex; align-items: center; gap: 7px; font-weight: 600; }
+.buttons { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+button { padding: 8px 11px; border: 1px solid #8888; border-radius: 6px; cursor: pointer; }
+button:disabled, input:disabled { cursor: wait; opacity: .6; }
+.detail { opacity: .75; font-size: 12px; }
+.attention { border-left: 3px solid #c57a1b; padding-left: 10px; }
