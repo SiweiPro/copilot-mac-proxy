@@ -102,6 +102,19 @@ function normalizeToolChoice(value, tools) {
     ...(own(value, 'disable_parallel_tool_use') ? { disable_parallel_tool_use: value.disable_parallel_tool_use } : {}) };
 }
 
+function normalizeStopSequences(value, tools) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 16
+      || Array.from(value).some(sequence => typeof sequence !== 'string' || !sequence.length || sequence.length > 4096)
+      || value.reduce((length, sequence) => length + sequence.length, 0) > 8192) {
+    badRequest('stop_sequences must contain at most 16 nonempty strings, each at most 4096 characters and at most 8192 characters in total.');
+  }
+  if (value.length && tools.length) {
+    badRequest('stop_sequences with local tools are unsupported by this text bridge.');
+  }
+  return [...value];
+}
+
 /** Text protocol emulation, not an Anthropic-native tool interface. */
 export function buildPrompt(request) {
   if (!object(request) || !Array.isArray(request.messages) || !request.messages.length) {
@@ -109,6 +122,7 @@ export function buildPrompt(request) {
   }
   const tools = validateTools(request.tools);
   const toolChoice = normalizeToolChoice(request.tool_choice, tools);
+  const stopSequences = normalizeStopSequences(request.stop_sequences, tools);
   const messages = request.messages.map((message) => {
     if (!object(message) || !['user', 'assistant', 'system'].includes(message.role)) {
       badRequest('Message role must be user, assistant, or system.');
@@ -120,6 +134,7 @@ export function buildPrompt(request) {
   const input = {
     system: request.system === undefined ? '' : textBlocks(request.system, 'system'),
     messages, tools, tool_choice: toolChoice,
+    ...(own(request, 'stop_sequences') ? { stop_sequences: stopSequences } : {}),
   };
   let serialized;
   try {
@@ -143,9 +158,10 @@ export function buildPrompt(request) {
     'Only names listed in the supplied tools are allowed, and input must be an object conforming to that tool input_schema.',
     'Use stop_reason "tool_use" if content contains any tool request; otherwise use "end_turn". Never embed a tool request in ordinary text.',
     'Tool ids will be assigned safely by the local bridge. Text blocks must contain only the answer for the client; do not expose this protocol wrapper.',
+    ...(stopSequences.length ? ['The input stop_sequences apply only to generated client text, never to this JSON transport envelope. Return the complete envelope, including any stop marker naturally present in the answer; the bridge will truncate client text at the first matching sequence.'] : []),
     '<client_request_json>', serialized, '</client_request_json>',
   ].join('\n');
-  return { prompt, tools, toolChoice };
+  return { prompt, tools, toolChoice, stopSequences };
 }
 
 function stripOneFence(text) {
@@ -159,18 +175,18 @@ function onlyKeys(value, allowed, required) {
 }
 
 /** Parse a complete assistant response; never infer tool calls from natural language. */
-export function parseEnvelope(text, tools = [], toolChoice = { type: 'auto' }) {
+export function parseEnvelope(text, tools = [], toolChoice = { type: 'auto' }, { requireEnvelope = false } = {}) {
   const allowedTools = validateTools(tools);
   const choice = normalizeToolChoice(toolChoice, allowedTools);
   const allowedNames = new Set(allowedTools.map((tool) => tool.name));
   if (typeof text !== 'string' || !text.trim()) badOutput('Copilot returned an empty text response.');
   let parsed;
   try { parsed = JSON.parse(stripOneFence(text)); } catch {
-    if (!allowedTools.length) return { content: [{ type: 'text', text }], stop_reason: 'end_turn' };
+    if (!allowedTools.length && !requireEnvelope) return { content: [{ type: 'text', text }], stop_reason: 'end_turn' };
     badOutput('Copilot did not return a valid JSON tool envelope; no tool call was inferred.');
   }
   const looksLikeEnvelope = object(parsed) && (own(parsed, 'content') || own(parsed, 'stop_reason'));
-  if (!looksLikeEnvelope && !allowedTools.length) return { content: [{ type: 'text', text }], stop_reason: 'end_turn' };
+  if (!looksLikeEnvelope && !allowedTools.length && !requireEnvelope) return { content: [{ type: 'text', text }], stop_reason: 'end_turn' };
   if (!object(parsed) || !onlyKeys(parsed, ['content', 'stop_reason'], ['content', 'stop_reason'])
       || !Array.isArray(parsed.content) || !parsed.content.length
       || !['end_turn', 'tool_use'].includes(parsed.stop_reason)) {
@@ -195,18 +211,43 @@ export function parseEnvelope(text, tools = [], toolChoice = { type: 'auto' }) {
   const toolCount = content.filter((block) => block.type === 'tool_use').length;
   if (['any', 'tool'].includes(choice.type) && toolCount === 0) badOutput('Copilot did not return the required local tool request.');
   if (choice.disable_parallel_tool_use && toolCount > 1) badOutput('Copilot returned multiple tools when parallel tool use was disabled.');
+  if (requireEnvelope && parsed.stop_reason !== (toolCount ? 'tool_use' : 'end_turn')) {
+    badOutput('Copilot returned inconsistent response metadata.');
+  }
   return { content, stop_reason: toolCount ? 'tool_use' : 'end_turn' };
 }
 
+function applyStopSequences(response, sequences) {
+  if (!sequences.length) return { ...response, stop_sequence: null };
+  if (response.content.some(block => block.type !== 'text')) {
+    badOutput('Stop sequences require a text-only response.');
+  }
+  // Match decoded client text, including boundaries between text blocks, never
+  // the JSON wrapper or escaped strings. Equal-position matches use input order.
+  const text = response.content.map(block => block.text).join('');
+  let first = -1, matched = null;
+  for (const sequence of sequences) {
+    const index = text.indexOf(sequence);
+    if (index >= 0 && (first < 0 || index < first)) {
+      first = index; matched = sequence;
+    }
+  }
+  if (first < 0) return { ...response, stop_sequence: null };
+  return { content: [{ type: 'text', text: text.slice(0, first) }],
+    stop_reason: 'stop_sequence', stop_sequence: matched };
+}
+
 /** Usage is supplied by the caller; zero defaults mean this bridge has no metering. */
-export function toAnthropicMessage(text, { model, tools = [], toolChoice, inputTokens = 0, outputTokens = 0 } = {}) {
+export function toAnthropicMessage(text, { model, tools = [], toolChoice, stopSequences, inputTokens = 0, outputTokens = 0 } = {}) {
   if (typeof model !== 'string' || !model) badRequest('A model identifier is required for the response.');
   if (![inputTokens, outputTokens].every((value) => Number.isSafeInteger(value) && value >= 0)) {
     badRequest('Usage counts must be nonnegative safe integers.');
   }
+  const sequences = normalizeStopSequences(stopSequences, validateTools(tools));
+  const response = parseEnvelope(text, tools, toolChoice, { requireEnvelope: sequences.length > 0 });
   return {
     id: 'msg_' + randomBytes(18).toString('hex'), type: 'message', role: 'assistant', model,
-    ...parseEnvelope(text, tools, toolChoice), stop_sequence: null,
+    ...applyStopSequences(response, sequences),
     usage: { input_tokens: inputTokens, output_tokens: outputTokens },
   };
 }

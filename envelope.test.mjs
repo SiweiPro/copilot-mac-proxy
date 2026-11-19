@@ -162,3 +162,82 @@ test('synthetic no-side-effect tool round trip preserves results and produces Cl
   assert.deepEqual(final.usage, { input_tokens: 0, output_tokens: 0 });
   assert.match(final.id, /^msg_[a-f0-9]{36}$/);
 });
+
+test('stop sequences preserve the caller contract without truncating the transport envelope', () => {
+  const request = { ...basic, stop_sequences: ['</decision>', '終わり🛑'] };
+  const built = buildPrompt(request);
+  const payload = JSON.parse(built.prompt.split('<client_request_json>\n')[1].split('\n</client_request_json>')[0]);
+  assert.deepEqual(payload.stop_sequences, request.stop_sequences);
+  assert.deepEqual(built.stopSequences, request.stop_sequences);
+  assert.notEqual(built.stopSequences, request.stop_sequences);
+  assert.match(built.prompt, /Return the complete envelope/);
+  assert.deepEqual(buildPrompt(basic).stopSequences, []);
+});
+
+test('stop sequence requests reject invalid values and combinations with local tools', () => {
+  for (const stop_sequences of [null, 'END', {}, [null], [1], [''], new Array(1),
+    Array(17).fill('END'), ['x'.repeat(4097)], Array(3).fill('x'.repeat(3000))]) {
+    fails(() => buildPrompt({ ...basic, stop_sequences }), 400);
+    fails(() => toAnthropicMessage(wrap([text('Done')]), { model: 'test-model', stopSequences: stop_sequences }), 400);
+  }
+  fails(() => buildPrompt({ ...basic, tools: [tool], stop_sequences: ['END'] }), 400);
+  fails(() => toAnthropicMessage(wrap([call()], 'tool_use'), { model: 'test-model', tools: [tool], stopSequences: ['END'] }), 400);
+  assert.deepEqual(buildPrompt({ ...basic, tools: [tool], stop_sequences: [] }).stopSequences, []);
+});
+
+test('stops apply identically to opposite synthetic decisions without inventing a verdict', () => {
+  for (const verdict of ['yes', 'no']) {
+    const raw = wrap([text('<analysis>Synthetic fixture.</analysis><decision>' + verdict + '</decision>ignored')]);
+    const result = toAnthropicMessage(raw, { model: 'test-model', stopSequences: ['</decision>'] });
+    assert.deepEqual(result.content, [text('<analysis>Synthetic fixture.</analysis><decision>' + verdict)]);
+    assert.equal(result.stop_reason, 'stop_sequence');
+    assert.equal(result.stop_sequence, '</decision>');
+  }
+});
+
+test('earliest decoded text stop wins across blocks, unicode, duplicate and overlapping sequences', () => {
+  const result = toAnthropicMessage(wrap([text('保留😀前綴\n</de'), text('cision>hidden STOP')]), {
+    model: 'test-model', stopSequences: ['STOP', '</decision>', '</decision>', '</decision>hidden'],
+  });
+  assert.deepEqual(result.content, [text('保留😀前綴\n')]);
+  assert.equal(result.stop_sequence, '</decision>');
+  assert.equal(result.stop_reason, 'stop_sequence');
+  const unicode = toAnthropicMessage(wrap([text('a😀b')]), { model: 'test-model', stopSequences: ['😀'] });
+  assert.deepEqual(unicode.content, [text('a')]);
+  const overlap = toAnthropicMessage(wrap([text('prefix STOPPED suffix')]), { model: 'test-model', stopSequences: ['STOPPED', 'STOP'] });
+  assert.equal(overlap.stop_sequence, 'STOPPED');
+});
+
+test('a stop at the start permits empty generated text without fabricating content', () => {
+  const result = toAnthropicMessage(wrap([text('ENDhidden')]), { model: 'test-model', stopSequences: ['END'] });
+  assert.deepEqual(result.content, [text('')]);
+  assert.equal(result.stop_reason, 'stop_sequence');
+  assert.equal(result.stop_sequence, 'END');
+});
+
+test('unmatched stops retain the original text blocks and end_turn metadata', () => {
+  const content = [text('<decision>no'), text(' explicit incomplete marker')];
+  const result = toAnthropicMessage(wrap(content), { model: 'test-model', stopSequences: ['</decision>'] });
+  assert.deepEqual(result.content, content);
+  assert.equal(result.stop_reason, 'end_turn');
+  assert.equal(result.stop_sequence, null);
+  const wrapperOnly = toAnthropicMessage(wrap([text('answer')]), { model: 'test-model', stopSequences: ['content', 'end_turn'] });
+  assert.deepEqual(wrapperOnly.content, [text('answer')]);
+  assert.equal(wrapperOnly.stop_reason, 'end_turn');
+});
+
+test('stop sequences never conceal invalid envelopes, forbidden tools or inconsistent metadata', () => {
+  for (const raw of [
+    'END raw text', '{"content":[', '{"answer":"END"}', '[]',
+    wrap([text('END'), call()], 'tool_use'), wrap([text('END')], 'tool_use'),
+    wrap([text('END'), { type: 'text', text: 123 }]),
+    JSON.stringify({ content: [text('END')], stop_reason: 'end_turn', extra: true }),
+  ]) {
+    fails(() => toAnthropicMessage(raw, { model: 'test-model', stopSequences: ['END'] }), 502);
+  }
+  const fence = String.fromCharCode(96).repeat(3);
+  const result = toAnthropicMessage(fence + 'json\n' + wrap([text('valueENDhidden')]) + '\n' + fence, {
+    model: 'test-model', stopSequences: ['END'],
+  });
+  assert.deepEqual(result.content, [text('value')]);
+});

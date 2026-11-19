@@ -70,8 +70,8 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     if (!body || Array.isArray(body) || typeof body !== 'object') return send(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'A JSON object is required' } });
     if (!models[body.model]) return send(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'Use copilot-claude-opus-5.5 or copilot-claude-fable-5.1' } });
-    const { prompt, tools, toolChoice } = buildPrompt(body);
-    if (body.stop_sequences?.length || body.output_config?.format) return send(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'This text bridge does not implement stop_sequences or structured output format.' } });
+    const { prompt, tools, toolChoice, stopSequences } = buildPrompt(body);
+    if (body.output_config?.format) return send(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'This text bridge does not implement structured output format.' } });
     if (prompt.length > 200000) return send(res, 413, { type: 'error', error: { type: 'invalid_request_error', message: 'Text bridge prompt exceeds the conservative 200000-character limit; start a smaller session.' } });
     if (url.pathname.endsWith('/count_tokens')) { res.setHeader('x-copilot-token-count', 'estimated'); return send(res, 200, { input_tokens: Math.ceil(Buffer.byteLength(prompt) / 3) }); }
     const session = sessions[body.model];
@@ -85,17 +85,17 @@ const server = http.createServer(async (req, res) => {
       event(res, 'ping', { type: 'ping' }); ping = setInterval(() => event(res, 'ping', { type: 'ping' }), 10000);
     }
     const result = await chat({ session, text: prompt, signal: controller.signal, timeoutMs: 180000 });
-    const msg = toAnthropicMessage(result.text, { model: body.model, tools, toolChoice, inputTokens: Math.ceil(Buffer.byteLength(prompt) / 3), outputTokens: Math.ceil(Buffer.byteLength(result.text) / 3) });
+    const msg = toAnthropicMessage(result.text, { model: body.model, tools, toolChoice, stopSequences, inputTokens: Math.ceil(Buffer.byteLength(prompt) / 3), outputTokens: Math.ceil(Buffer.byteLength(result.text) / 3) });
     totals[body.model] = (totals[body.model] || 0) + 1;
     if (!stream) { res.setHeader('x-copilot-usage', 'estimated'); return send(res, 200, msg); }
     clearInterval(ping);
-    event(res, 'message_start', { type: 'message_start', message: { ...msg, content: [], stop_reason: null, usage: { input_tokens: msg.usage.input_tokens, output_tokens: 0 } } });
+    event(res, 'message_start', { type: 'message_start', message: { ...msg, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: msg.usage.input_tokens, output_tokens: 0 } } });
     for (const [index, block] of msg.content.entries()) {
       event(res, 'content_block_start', { type: 'content_block_start', index, content_block: block.type === 'text' ? { type: 'text', text: '' } : { ...block, input: {} } });
       event(res, 'content_block_delta', { type: 'content_block_delta', index, delta: block.type === 'text' ? { type: 'text_delta', text: block.text } : { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } });
       event(res, 'content_block_stop', { type: 'content_block_stop', index });
     }
-    event(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: msg.stop_reason, stop_sequence: null }, usage: { output_tokens: msg.usage.output_tokens } });
+    event(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: msg.stop_reason, stop_sequence: msg.stop_sequence }, usage: { output_tokens: msg.usage.output_tokens } });
     event(res, 'message_stop', { type: 'message_stop' }); res.end();
   } catch (e) {
     const status = e.status || 502;
